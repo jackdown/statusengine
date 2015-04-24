@@ -131,7 +131,7 @@ class StatusengineLegacyShell extends AppShell{
 		$this->createParentHosts = [];
 		$this->createParentServices = [];
 		
-		$this->maxJobIdelCounter = 500;
+		$this->maxJobIdleCounter = 500;
 		
 		//We only start dumping objects to the db if this is true.
 		//If you kill the script while it dumps data, you may be have problems on restart statusengine.
@@ -2664,18 +2664,18 @@ class StatusengineLegacyShell extends AppShell{
 		$this->Logfile->stlog('Lets rock!');
 		$this->sendSignal(SIGUSR1);
 		$this->worker->setTimeout(500);
-		$jobIdelCounter = 0;
+		$jobIdleCounter = 0;
 		while(true){
 			pcntl_signal_dispatch();
 			if($this->worker->work() === false){
 				//Worker returend false, looks like the queue is empty
-				if($jobIdelCounter < $this->maxJobIdelCounter){
-					$jobIdelCounter++;
+				if($jobIdleCounter < $this->maxJobIdleCounter){
+					$jobIdleCounter++;
 				}
 			}else{
-				$jobIdelCounter = 0;
+				$jobIdleCounter = 0;
 			}
-			if($jobIdelCounter === $this->maxJobIdelCounter){
+			if($jobIdleCounter === $this->maxJobIdleCounter){
 				//The worker will sleep because therer are no jobs to do
 				//This will save CPU time!
 				usleep(250000);
@@ -2739,18 +2739,18 @@ class StatusengineLegacyShell extends AppShell{
 	}
 	
 	public function childWork(){
-		$jobIdelCounter = 0;
+		$jobIdleCounter = 0;
 		while($this->work === true){
 			pcntl_signal_dispatch();
 			if($this->worker->work() === false){
 				//Worker returend false, looks like the queue is empty
-				if($jobIdelCounter < $this->maxJobIdelCounter){
-					$jobIdelCounter++;
+				if($jobIdleCounter < $this->maxJobIdleCounter){
+					$jobIdleCounter++;
 				}
 			}else{
-				$jobIdelCounter = 0;
+				$jobIdleCounter = 0;
 			}
-			if($jobIdelCounter === $this->maxJobIdelCounter){
+			if($jobIdleCounter === $this->maxJobIdleCounter){
 				//The worker will sleep because therer are no jobs to do
 				//This will save CPU time!
 				usleep(250000);
