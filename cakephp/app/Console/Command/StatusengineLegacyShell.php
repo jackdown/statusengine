@@ -40,7 +40,7 @@
 **********************************************************************************/
 
 class StatusengineLegacyShell extends AppShell{
-	public $tasks = ['Logfile', 'Memcached'];
+	public $tasks = ['Logfile', 'Memcached', 'Cache'];
 	
 	//Load models out of Plugin/Legacy/Model
 	public $uses = [
@@ -171,6 +171,9 @@ class StatusengineLegacyShell extends AppShell{
 	 */
 	public function main(){
 		Configure::load('Statusengine');
+		
+		ini_set('error_log', Configure::read('logfile'));
+		
 		$this->Logfile->init();
 		$this->Logfile->welcome();
 		$this->parser = $this->getOptionParser();
@@ -192,6 +195,24 @@ class StatusengineLegacyShell extends AppShell{
 			
 		}
 		
+		//Fork Cache process
+		$pid = pcntl_fork();
+		if(!$pid){
+			//We are the cache child
+			$this->Logfile->clog('Hey, I\'m the cache worker');
+			
+			$this->Logfile->clog('Build up my servicestatus cache');
+			$this->Cache->buildServicestatusCache();
+			$this->Cache->gearmanConnect();
+			
+			//go to while(true)...
+			$this->Cache->work();
+		}else{
+			//I'm still the parent and need to save the pid of my child
+			$this->childPids[] = $pid;
+		}
+		
+		
 		if(array_key_exists('worker', $this->params)){
 			
 			$this->workerMode = true;
@@ -202,7 +223,7 @@ class StatusengineLegacyShell extends AppShell{
 			$this->clearObjectsCache();
 			$this->buildObjectsCache();
 			$this->buildHoststatusCache();
-			$this->buildServicestatusCache();
+			//$this->buildServicestatusCache();
 			$this->Scheduleddowntime->cleanup();
 			$this->Dbversion->save([
 				'Dbversion' => [
@@ -311,7 +332,15 @@ class StatusengineLegacyShell extends AppShell{
 			case FINISH_OBJECT_DUMP:
 				$this->Logfile->stlog('Finished dumping objects');
 				$this->buildHoststatusCache();
-				$this->buildServicestatusCache();
+				
+				$payload = json_encode([
+					'task' => 'buildServicestatusCache',
+				]);
+				
+				$this->cacheClient->doNormal('statusngin_cachecom', $payload);
+				unset($payload);
+				
+				//$this->buildServicestatusCache();
 				$this->saveParentHosts();
 				$this->saveParentServices();
 				//We are done with object dumping and can write parent hosts and services to DB
@@ -2235,7 +2264,7 @@ class StatusengineLegacyShell extends AppShell{
 		/* Avoid that gearman will stuck at GearmanWorker::work() if no jobs are present
 		 * witch is bad because if GearmanWorker::work() stuck, PHP can not execute the signal handler
 		 */
-		$this->worker->addOptions (GEARMAN_WORKER_NON_BLOCKING);
+		$this->worker->addOptions(GEARMAN_WORKER_NON_BLOCKING);
 		
 		$this->worker->addServer(Configure::read('server'), Configure::read('port'));
 		
@@ -2444,14 +2473,28 @@ class StatusengineLegacyShell extends AppShell{
 	}
 	
 	public function addToServicestatusCache($serviceObjectId, $servicestatus_id){
-		$this->servicestatusCache[$serviceObjectId] = $servicestatus_id;
+		$payload = json_encode([
+			'task' => 'addToServicestatusCache',
+			'serviceObjectId' => $serviceObjectId,
+			'servicestatus_id' => $servicestatus_id
+		]);
+		$this->cacheClient->doNormal('statusngin_cachecom', $payload);
+		
+		//$this->servicestatusCache[$serviceObjectId] = $servicestatus_id;
 	}
 	
 	public function servicestatusIdFromCache($serviceObjectId){
+		$payload = json_encode([
+			'task' => 'servicestatusIdFromCache',
+			'serviceObjectId' => $serviceObjectId
+		]);
+		return $this->cacheClient->doNormal('statusngin_cachecom', $payload);
+		
+		/*
 		if(isset($this->servicestatusCache[$serviceObjectId])){
 			return $this->servicestatusCache[$serviceObjectId];
 		}
-		
+		*/
 		return null;
 	}
 	
@@ -2634,7 +2677,17 @@ class StatusengineLegacyShell extends AppShell{
 				$this->bindQueues = true;
 				$this->queues = $worker['queues'];
 				$this->work = false;
+				
+				//Avoid MySQL is missing error due to forking
+				$this->Service->getDatasource()->reconnect();
+				
 				$this->bindChildSignalHandler();
+				
+				$this->Logfile->clog('Create my cache client');
+				$this->cacheClient = new GearmanClient();
+				$this->cacheClient->addServer(Configure::read('server'), Configure::read('port'));
+				
+				
 				$this->waitForInstructions();
 			}else{
 				//we are the parrent
@@ -2651,7 +2704,7 @@ class StatusengineLegacyShell extends AppShell{
 		$this->clearObjectsCache();
 		$this->buildObjectsCache();
 		$this->buildHoststatusCache();
-		$this->buildServicestatusCache();
+		//$this->buildServicestatusCache();
 		$this->Scheduleddowntime->cleanup();
 		$this->Dbversion->save([
 			'Dbversion' => [
@@ -2722,7 +2775,7 @@ class StatusengineLegacyShell extends AppShell{
 				$this->buildHoststatusCache();
 				
 				$this->Logfile->clog('Build up new servicestatus cache');
-				$this->buildServicestatusCache();
+				//$this->buildServicestatusCache();
 				
 				$this->Logfile->clog('I will continue my work');
 				$this->childWork();

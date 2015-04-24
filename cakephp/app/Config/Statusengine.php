@@ -1,6 +1,6 @@
 <?php
 $config = [
-	'version' => '1.2.0', //program version
+	'version' => '1.2.3', //program version
 	'logfile' => '/var/log/statusengine.log',
 	'servicestatus_freshness' => 30, //max age of service status recors in gearman
 	'server' => '127.0.0.1', //address of gearman-job-server
