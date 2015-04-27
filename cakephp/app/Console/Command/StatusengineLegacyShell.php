@@ -40,7 +40,7 @@
 **********************************************************************************/
 
 class StatusengineLegacyShell extends AppShell{
-	public $tasks = ['Logfile', 'Memcached', 'Cache'];
+	public $tasks = ['Logfile', 'Memcached', 'Cache', 'ObjectWorker'];
 	
 	//Load models out of Plugin/Legacy/Model
 	public $uses = [
@@ -195,6 +195,12 @@ class StatusengineLegacyShell extends AppShell{
 			
 		}
 		
+		$this->useObjectWorkers = false;
+		if(Configure::read('object_workers') > 0){
+			$this->useObjectWorkers = true;
+		}
+		$this->ImTheParentProcess = true;
+		
 		//Fork Cache process
 		$pid = pcntl_fork();
 		if(!$pid){
@@ -273,8 +279,8 @@ class StatusengineLegacyShell extends AppShell{
 			case START_OBJECT_DUMP:
 				if($this->workerMode === true){
 					$this->sendSignal(SIGUSR2);
-					
 				}
+				
 				$this->dumpObjects = true;
 				$this->fakeLastInsertId = 1;
 				$this->Logfile->stlog('Start dumping objects');
@@ -323,36 +329,114 @@ class StatusengineLegacyShell extends AppShell{
 					$this->{$Model}->deleteAll(true);
 				}
 		
-				$this->clearObjectsCache();
-				$this->buildObjectsCache();
+				if($this->workerMode === true && $this->useObjectWorkers === false){
+					// We only use local cache if Statusengine is running without -w or object_workers
+					// are disabled by the config file
+					$this->clearObjectsCache();
+					$this->buildObjectsCache();
+				}else{
+					if($this->ImTheParentProcess === true){
+						$objectWorkerPids = [];
+						for($i = 0; $i < Configure::read('object_workers'); $i++){
+							$pid = pcntl_fork();
+							if(!$pid){
+								$this->ImTheParentProcess = false;
+								$this->cacheClient = new GearmanClient();
+								$this->cacheClient->addServer(Configure::read('server'), Configure::read('port'));
+					
+								// I'm are one of the object workers.
+								// I'm just a tmp process, if i finished my work, i will kill my self ;)
+
+								//Avoid MySQL errors due to fork
+								$this->Objects->getDatasource()->reconnect();
+
+								$this->ObjectWorker->gearmanConnect(Configure::read('server'), Configure::read('port'), $this);
+								//Start dumping objects is a singel thread safe forked process
+								$this->ObjectWorker->work();
+
+							}else{
+								//We are the parent process
+								$objectWorkerPids[] = $pid;
+							}
+						}
+					
+						//Wait until all tmp workers are dead, so all objects are dump to the db and we can continue our work
+						foreach($objectWorkerPids as $pid){
+							pcntl_waitpid($pid, $status);
+						}
+					
+						//All objects dumped to the database
+						$this->Logfile->stlog('Finished dumping objects (using ObjectWorkers)');
+						$this->buildHoststatusCache();
+		
+						$payload = json_encode([
+							'task' => 'buildServicestatusCache',
+						]);
+		
+						$this->cacheClient->doNormal('statusngin_cachecom', $payload);
+						unset($payload);
+		
+						//Get the parent hosts and services to save
+			
+			
+						$payload = json_encode([
+							'task' => 'getParentHostsCache',
+						]);
+		
+						$this->createParentHosts = unserialize($this->cacheClient->doNormal('statusngin_cachecom', $payload));
+						unset($payload);
+			
+			
+						$payload = json_encode([
+							'task' => 'getParentServicesCache',
+						]);
+		
+						$this->createParentServices = unserialize($this->cacheClient->doNormal('statusngin_cachecom', $payload));
+						unset($payload);
+						$this->saveParentHosts();
+						$this->saveParentServices();
+						//We are done with object dumping and can write parent hosts and services to DB
+		
+						$this->Logfile->stlog('Start dumping core config '.Configure::read('coreconfig').' to database');
+						$this->dumpCoreConfig();
+						$this->Logfile->stlog('Core config dump finished');
+		
+						if($this->workerMode === true){
+							$this->sendSignal(SIGUSR1);
+						}
+						$this->dumpObjects = false;
+					}
+				}
 				$this->createParentHosts = [];
 				$this->createParentServices = [];
 				break;
 				
 			case FINISH_OBJECT_DUMP:
-				$this->Logfile->stlog('Finished dumping objects');
-				$this->buildHoststatusCache();
+				if($this->useObjectWorkers === false){
+					$this->Logfile->stlog('Finished dumping objects');
+					$this->buildHoststatusCache();
 				
-				$payload = json_encode([
-					'task' => 'buildServicestatusCache',
-				]);
+					$payload = json_encode([
+						'task' => 'buildServicestatusCache',
+					]);
 				
-				$this->cacheClient->doNormal('statusngin_cachecom', $payload);
-				unset($payload);
+					$this->cacheClient->doNormal('statusngin_cachecom', $payload);
+					unset($payload);
 				
-				//$this->buildServicestatusCache();
-				$this->saveParentHosts();
-				$this->saveParentServices();
-				//We are done with object dumping and can write parent hosts and services to DB
+					//$this->buildServicestatusCache();
+					$this->saveParentHosts();
+					$this->saveParentServices();
+					//We are done with object dumping and can write parent hosts and services to DB
 				
-				$this->Logfile->stlog('Start dumping core config '.Configure::read('coreconfig').' to database');
-				$this->dumpCoreConfig();
-				$this->Logfile->stlog('Core config dump finished');
+					$this->Logfile->stlog('Start dumping core config '.Configure::read('coreconfig').' to database');
+					$this->dumpCoreConfig();
+					$this->Logfile->stlog('Core config dump finished');
 				
-				if($this->workerMode === true){
-					$this->sendSignal(SIGUSR1);
+					if($this->workerMode === true){
+						$this->sendSignal(SIGUSR1);
+					}
+					$this->dumpObjects = false;
 				}
-				$this->dumpObjects = false;
 				break;
 			
 			//Command object
@@ -360,6 +444,11 @@ class StatusengineLegacyShell extends AppShell{
 				if($this->dumpObjects === false){
 					break;
 				}
+				
+				if($this->useObjectWorkers === true){
+					$this->ObjectWorker->sleepIfLastProjectObjectWasAnotherObjectType(OBJECT_COMMAND);
+				}
+				
 				$this->Command->create();
 				$data = [
 					'Objects' => [
@@ -396,6 +485,11 @@ class StatusengineLegacyShell extends AppShell{
 				if($this->dumpObjects === false){
 					break;
 				}
+				
+				if($this->useObjectWorkers === true){
+					$this->ObjectWorker->sleepIfLastProjectObjectWasAnotherObjectType(OBJECT_TIMEPERIOD);
+				}
+				
 				$this->Timeperiod->create();
 				$timeperiodObjectId = $this->objectIdFromCache($payload->object_type, $payload->name);
 	
@@ -462,6 +556,11 @@ class StatusengineLegacyShell extends AppShell{
 				if($this->dumpObjects === false){
 					break;
 				}
+				
+				if($this->useObjectWorkers === true){
+					$this->ObjectWorker->sleepIfLastProjectObjectWasAnotherObjectType(OBJECT_CONTACT);
+				}
+				
 				$this->Contact->create();
 				$data = [
 					'Objects' => [
@@ -567,6 +666,11 @@ class StatusengineLegacyShell extends AppShell{
 				if($this->dumpObjects === false){
 					break;
 				}
+				
+				if($this->useObjectWorkers === true){
+					$this->ObjectWorker->sleepIfLastProjectObjectWasAnotherObjectType(OBJECT_CONTACTGROUP);
+				}
+				
 				$this->Contactgroup->create();
 				$data = [
 					'Objects' => [
@@ -616,6 +720,11 @@ class StatusengineLegacyShell extends AppShell{
 				if($this->dumpObjects === false){
 					break;
 				}
+				
+				if($this->useObjectWorkers === true){
+					$this->ObjectWorker->sleepIfLastProjectObjectWasAnotherObjectType(OBJECT_HOST);
+				}
+				
 				$this->Host->create();
 				$data = [
 					'Objects' => [
@@ -701,8 +810,19 @@ class StatusengineLegacyShell extends AppShell{
 				
 				$result = $this->Host->save($data);
 				//$lastInsertId = $this->Host->rawSave([$data]);
-				foreach($payload->parent_hosts as $parentHost){
-					$this->createParentHosts[$result['Host']['host_id']][] = $parentHost;
+				if($this->useObjectWorkers === false){
+					foreach($payload->parent_hosts as $parentHost){
+						$this->createParentHosts[$result['Host']['host_id']][] = $parentHost;
+					}
+				}else{
+					$_payload = json_encode([
+						'task' => 'addParentHostsToCache',
+						'host_id' => $result['Host']['host_id'],
+						'parentHost' => $parentHost,
+					]);
+					$this->cacheClient->doNormal('statusngin_cachecom', $_payload);
+					unset($_payload);
+					
 				}
 				
 				foreach($payload->contactgroups as $contactgroupName){
@@ -751,6 +871,11 @@ class StatusengineLegacyShell extends AppShell{
 				if($this->dumpObjects === false){
 					break;
 				}
+				
+				if($this->useObjectWorkers === true){
+					$this->ObjectWorker->sleepIfLastProjectObjectWasAnotherObjectType(OBJECT_HOSTGROUP);
+				}
+				
 				$this->Hostgroup->create();
 				
 				$data = [
@@ -800,6 +925,11 @@ class StatusengineLegacyShell extends AppShell{
 				if($this->dumpObjects === false){
 					break;
 				}
+				
+				if($this->useObjectWorkers === true){
+					$this->ObjectWorker->sleepIfLastProjectObjectWasAnotherObjectType(OBJECT_SERVICE);
+				}
+				
 				//$this->Service->create();
 				
 				$objectId = $this->objectIdFromCache(OBJECT_SERVICE, $payload->host_name, $payload->description);
@@ -938,13 +1068,26 @@ class StatusengineLegacyShell extends AppShell{
 						'importance' => $payload->hourly_value
 					]
 				];
-				$result = $this->Service->rawSave([$data], false);
-				$lastInsertId = null;
+				
+				if($this->useObjectWorkers === false){
+					$result = $this->Service->rawSave([$data], false);
+					$lastInsertId = null;
+				}else{
+					unset($data['Service']['service_id']);
+					$this->Service->create();
+					$result = $this->Service->save($data);
+					$lastInsertId = $result = $result['Service']['service_id'];
+					
+				}
+				
+				
 				//if(isset($result['Service']['service_id'])){
 				//	$lastInsertId = $result['Service']['service_id'];
 				//}
 				
-				$lastInsertId = $this->fakeLastInsertId;
+				if($this->useObjectWorkers === false){
+					$lastInsertId = $this->fakeLastInsertId;
+				}
 				
 				if($lastInsertId == null){
 					$this->fakeLastInsertId++;
@@ -955,14 +1098,26 @@ class StatusengineLegacyShell extends AppShell{
 				unset($data);
 				
 				//Must run if all services are in the database, or we get in trouble!
-				foreach($payload->parent_services as $parentService){
-					$this->createParentServices[$lastInsertId][] = [
-						'host_name' => $payload->host_name,
-						'description' => $payload->description
-							
-					];
+				if($this->useObjectWorkers === false){
+					foreach($payload->parent_services as $parentService){
+						$this->createParentServices[$lastInsertId][] = [
+							'host_name' => $payload->host_name,
+							'description' => $payload->description
+						];
+					}
+				}else{
+					foreach($payload->parent_services as $parentService){
+						$_payload = json_encode([
+							'task' => 'addParentServicesToCache',
+							'id_service' => $lastInsertId,
+							'host_name' => $payload->host_name,
+							'description' => $payload->description
+						]);
+						$this->cacheClient->doNormal('statusngin_cachecom', $_payload);
+						unset($_payload);
+					}
 				}
-				
+
 				if(!empty($payload->contactgroups)){
 					foreach($payload->contactgroups as $contactgroupName){
 						$this->Servicecontactgroup->create();
@@ -1012,6 +1167,11 @@ class StatusengineLegacyShell extends AppShell{
 				if($this->dumpObjects === false){
 					break;
 				}
+				
+				if($this->useObjectWorkers === true){
+					$this->ObjectWorker->sleepIfLastProjectObjectWasAnotherObjectType(OBJECT_SERVICEGROUP);
+				}
+				
 				$this->Servicegroup->create();
 				$data = [
 					'Objects' => [
@@ -1059,6 +1219,11 @@ class StatusengineLegacyShell extends AppShell{
 				if($this->dumpObjects === false){
 					break;
 				}
+				
+				if($this->useObjectWorkers === true){
+					$this->ObjectWorker->sleepIfLastProjectObjectWasAnotherObjectType(OBJECT_HOSTESCALATION);
+				}
+				
 				//$this->Hostescalation->create();
 				$data = [
 					'Objects' => [
@@ -1122,6 +1287,11 @@ class StatusengineLegacyShell extends AppShell{
 				if($this->dumpObjects === false){
 					break;
 				}
+				
+				if($this->useObjectWorkers === true){
+					$this->ObjectWorker->sleepIfLastProjectObjectWasAnotherObjectType(OBJECT_SERVICEESCALATION);
+				}
+				
 				$data = [
 					'Objects' => [
 						'objecttype_id' => $payload->object_type,
@@ -1186,6 +1356,11 @@ class StatusengineLegacyShell extends AppShell{
 				if($this->dumpObjects === false){
 					break;
 				}
+				
+				if($this->useObjectWorkers === true){
+					$this->ObjectWorker->sleepIfLastProjectObjectWasAnotherObjectType(OBJECT_HOSTDEPENDENCY);
+				}
+				
 				$data = [
 					'Objects' => [
 						'objecttype_id' => $payload->object_type,
@@ -1225,6 +1400,11 @@ class StatusengineLegacyShell extends AppShell{
 				if($this->dumpObjects === false){
 					break;
 				}
+				
+				if($this->useObjectWorkers === true){
+					$this->ObjectWorker->sleepIfLastProjectObjectWasAnotherObjectType(OBJECT_SERVICEDEPENDENCY);
+				}
+				
 				$data = [
 					'Objects' => [
 						'objecttype_id' => $payload->object_type,
@@ -2259,7 +2439,7 @@ class StatusengineLegacyShell extends AppShell{
 	 * @return void
 	 */
 	public function gearmanConnect(){
-		$this->worker= new GearmanWorker();
+		$this->worker = new GearmanWorker();
 		
 		/* Avoid that gearman will stuck at GearmanWorker::work() if no jobs are present
 		 * witch is bad because if GearmanWorker::work() stuck, PHP can not execute the signal handler
@@ -2387,6 +2567,17 @@ class StatusengineLegacyShell extends AppShell{
 	 * @return int    object_id
 	 */
 	public function objectIdFromCache($objecttype_id, $name1, $name2 = null, $default = null){
+		if($this->useObjectWorkers === true){
+			$payload = json_encode([
+				'task' => 'objectIdFromCache',
+				'objecttype_id' => $objecttype_id,
+				'name1' => $name1,
+				'name2' => $name2,
+				'default' => $default
+			]);
+			return $this->cacheClient->doNormal('statusngin_cachecom', $payload);
+		}
+		
 		if(isset($this->objectCache[$objecttype_id][$name1.$name2]['object_id'])){
 			return $this->objectCache[$objecttype_id][$name1.$name2]['object_id'];
 		}
@@ -2417,6 +2608,16 @@ class StatusengineLegacyShell extends AppShell{
 	 * @return void
 	 */
 	public function addObjectToCache($objecttype_id, $id, $name1, $name2 = null){
+		if($this->useObjectWorkers === true){
+			$payload = json_encode([
+				'task' => 'addObjectToCache',
+				'objecttype_id' => $objecttype_id,
+				'id' => $id,
+				'name1' => $name1,
+				'name2' => $name2
+			]);
+			return $this->cacheClient->doNormal('statusngin_cachecom', $payload);
+		}
 		if(!isset($this->objectCache[$objecttype_id][$name1.$name2])){
 			$this->objectCache[$objecttype_id][$name1.$name2] = [
 				'name1' => $name1,
@@ -2439,6 +2640,8 @@ class StatusengineLegacyShell extends AppShell{
 	 */
 	public function buildHoststatusCache(){
 		$this->hoststatusCache = [];
+		//Avoid MySQL has gone away error
+		$this->Hoststatus->getDatasource()->reconnect();
 		foreach($this->Hoststatus->find('all', ['fields' => ['hoststatus_id', 'host_object_id']]) as $hs){
 			$this->hoststatusCache[$hs['Hoststatus']['host_object_id']] = $hs['Hoststatus']['hoststatus_id'];
 		}
@@ -2625,48 +2828,7 @@ class StatusengineLegacyShell extends AppShell{
 	 * @return void
 	 */
 	public function forkWorker(){
-		$workers = [
-			/*[
-				'queues' => [
-					'statusngin_objects' => 'dumpObjects',
-					'statusngin_programmstatus' => 'processProgrammstatus',
-					'statusngin_processdata' => 'processProcessdata'
-				]
-			],*/
-			[
-				'queues' => ['statusngin_servicestatus' => 'processServicestatus']
-			],
-			[
-				'queues' => [
-					'statusngin_hoststatus' => 'processHoststatus',
-					'statusngin_statechanges' => 'processStatechanges'
-				]
-			],
-			[
-				'queues' => ['statusngin_servicechecks' => 'processServicechecks']
-			],
-			[
-				'queues' => [
-					'statusngin_hostchecks' => 'processHostchecks',
-					'statusngin_logentries' => 'processLogentries'
-				]
-			],
-			[
-				'queues' => [
-					'statusngin_notifications' => 'processNotifications',
-					'statusngin_contactstatus' => 'processContactstatus',
-					'statusngin_contactnotificationdata' => 'processContactnotificationdata',
-					'statusngin_contactnotificationmethod' => 'processContactnotificationmethod',
-					'statusngin_acknowledgements' => 'processAcknowledgements',
-					'statusngin_comments' => 'processComments',
-					'statusngin_flappings' => 'processFlappings',
-					'statusngin_downtimes' => 'processDowntimes',
-					'statusngin_externalcommands' => 'processExternalcommands',
-					'statusngin_systemcommands' => 'processSystemcommands',
-					'statusngin_eventhandler' => 'processEventhandler'
-				]
-			]
-		];
+		$workers = Configure::read('workers');
 		foreach($workers as $worker){
 			declare(ticks = 1);
 			$this->Logfile->stlog('Forking a new worker child');
@@ -2701,8 +2863,22 @@ class StatusengineLegacyShell extends AppShell{
 		//Every worker is created now, so lets rock!
 		
 		$this->createInstance();
-		$this->clearObjectsCache();
-		$this->buildObjectsCache();
+		
+		$this->cacheClient = new GearmanClient();
+		$this->cacheClient->addServer(Configure::read('server'), Configure::read('port'));
+		
+		$payload = json_encode([
+			'task' => 'clearObjectsCache'
+		]);
+		$this->cacheClient->doNormal('statusngin_cachecom', $payload);
+		unset($payload);
+		
+		$payload = json_encode([
+			'task' => 'buildObjectsCache'
+		]);
+		$this->cacheClient->doNormal('statusngin_cachecom', $payload);
+		unset($payload);
+		
 		$this->buildHoststatusCache();
 		//$this->buildServicestatusCache();
 		$this->Scheduleddowntime->cleanup();
@@ -2728,6 +2904,8 @@ class StatusengineLegacyShell extends AppShell{
 			}else{
 				$jobIdleCounter = 0;
 			}
+			
+			
 			if($jobIdleCounter === $this->maxJobIdleCounter){
 				//The worker will sleep because therer are no jobs to do
 				//This will save CPU time!
@@ -2753,7 +2931,7 @@ class StatusengineLegacyShell extends AppShell{
 			/* Avoid that gearman will stuck at GearmanWorker::work() if no jobs are present
 			 * witch is bad because if GearmanWorker::work() stuck, PHP can not execute the signal handler
 			 */
-			$this->worker->addOptions (GEARMAN_WORKER_NON_BLOCKING);
+			$this->worker->addOptions(GEARMAN_WORKER_NON_BLOCKING);
 			
 			$this->worker->addServer(Configure::read('server'), Configure::read('port'));
 			foreach($this->queues as $queueName => $functionName){
