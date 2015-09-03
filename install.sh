@@ -33,7 +33,7 @@ set -e
 
 if grep -q DISTRIB_CODENAME=trusty /etc/lsb-release; then
 	apt-get update
-	apt-get install gearman-job-server libgearman-dev gearman-tools uuid-dev php5-gearman php5 php5-cli php5-dev libjson-c-dev manpages-dev build-essential
+	apt-get install gearman-job-server libgearman-dev gearman-tools uuid-dev php5-gearman php5-cli php5-dev libjson-c-dev manpages-dev build-essential
 	cd statusengine/src
 
 	echo -e "\nPlease define either NAEMON or NAGIOS."
@@ -41,12 +41,14 @@ if grep -q DISTRIB_CODENAME=trusty /etc/lsb-release; then
 	case "$monengine" in 
 		
 		NAEMON)
-		LANG=C gcc -shared -o statusengine.o -fPIC  -Wall -Werror statusengine.c -luuid -levent -lgearman -ljson-c -DNAEMON;
+		#LANG=C gcc -shared -o statusengine.o -fPIC  -Wall -Werror statusengine.c -luuid -levent -lgearman -ljson-c -DNAEMON;
+		LANG=C gcc -DNAEMON -shared -o statusengine.o -fPIC -D_GNU_SOURCE -Wall -Werror statusengine.c -luuid -levent -lgearman -ljson-c
 		;;
 	
 		NAGIOS)
-                LANG=C gcc -shared -o statusengine.o -fPIC  -Wall -Werror statusengine.c -luuid -levent -lgearman -ljson-c -DNAGIOS;
-                ;;
+                #LANG=C gcc -shared -o statusengine.o -fPIC  -Wall -Werror statusengine.c -luuid -levent -lgearman -ljson-c -DNAGIOS;
+		LANG=C gcc -DNAGIOS -shared -o statusengine.o -fPIC -D_GNU_SOURCE -Wall -Werror statusengine.c -luuid -levent -lgearman -ljson-c
+		;;
 
 		*)
 	        echo "ERR: Please define either 'NAEMON' or 'NAGIOS'. Script aborted.";
